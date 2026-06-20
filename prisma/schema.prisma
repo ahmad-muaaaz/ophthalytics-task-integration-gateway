@@ -1,0 +1,70 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum JobStatus {
+  PENDING
+  PROCESSING
+  COMPLETED
+  FAILED
+}
+
+enum DeliveryStatus {
+  PENDING
+  DELIVERED
+  FAILED
+}
+
+model Partner {
+  id        String   @id @default(uuid())
+  name      String
+  apiKey    String   @unique
+  createdAt DateTime @default(now())
+  jobs      Job[]
+}
+
+model Job {
+  id             String    @id @default(uuid())
+  partner        Partner   @relation(fields: [partnerId], references: [id])
+  partnerId      String
+  idempotencyKey String
+  status         JobStatus @default(PENDING)
+  metadata       Json
+  callbackUrl    String
+  reportPath     String?
+  error          String?
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+  attachments    Attachment[]
+  deliveries     WebhookDelivery[]
+
+  @@unique([partnerId, idempotencyKey])
+}
+
+model Attachment {
+  id          String   @id @default(uuid())
+  job         Job      @relation(fields: [jobId], references: [id])
+  jobId       String
+  filename    String
+  mimeType    String
+  sizeBytes   Int
+  storagePath String
+  createdAt   DateTime @default(now())
+}
+
+model WebhookDelivery {
+  id           String         @id @default(uuid())
+  job          Job            @relation(fields: [jobId], references: [id])
+  jobId        String
+  status       DeliveryStatus @default(PENDING)
+  attempts     Int            @default(0)
+  lastAttempt  DateTime?
+  nextRetryAt  DateTime?
+  responseCode Int?
+  createdAt    DateTime       @default(now())
+}
