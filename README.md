@@ -96,7 +96,7 @@ Files are written to `./storage-data/{partnerId}/` on local disk. Filenames are 
 Tokens are HMAC-SHA256 signed and encode the job ID and a one-hour expiry. The download endpoint verifies the signature and expiry before serving the file.
 
 **Signed webhook delivery**
-When a job reaches `COMPLETED` or `FAILED`, a `deliver-webhook` job is enqueued on the BullMQ `delivery` queue. The worker POSTs a signed JSON payload to the partner's `callbackUrl` from job metadata. Delivery state is tracked in `WebhookDelivery` (one row per job). Failed deliveries are retried up to 5 times with exponential backoff (2s base). After all retries are exhausted, the delivery is marked `FAILED`. Manual re-trigger is planned for Phase 9.
+When a job reaches `COMPLETED` or `FAILED`, a `deliver-webhook` job is enqueued on the BullMQ `delivery` queue. The worker POSTs a signed JSON payload to the partner's `callbackUrl` from job metadata. Delivery state is tracked in `WebhookDelivery` (one row per job). Failed deliveries are retried up to 5 times with exponential backoff (2s base). After all retries are exhausted, the delivery is marked `FAILED`. Partners can manually re-trigger delivery via `POST /v1/jobs/:id/webhooks/retry`.
 
 Webhook signing uses `WEBHOOK_SECRET` when set, otherwise falls back to `STORAGE_SECRET`.
 
@@ -118,8 +118,8 @@ Webhook signing uses `WEBHOOK_SECRET` when set, otherwise falls back to `STORAGE
 | `downloadUrl` | Signed download URL when completed, otherwise `null` |
 | `deliveredAt` | ISO-8601 timestamp of the delivery attempt |
 
-**Not yet built**
-Developer Console frontend (Phase 9) and manual webhook retry endpoint.
+**Developer Console**
+A React partner panel lives in the sibling directory `../frontend/`. It lets partners enter their API key, submit test jobs, poll status in real time, view webhook delivery state, download completed reports, and manually retry webhooks. See `../frontend/README.md` for frontend setup. Run the backend on `:3000` and the console on `:5173` (Vite proxies `/v1` to the API — no CORS configuration needed).
 
 ---
 
@@ -173,12 +173,45 @@ Developer Console frontend (Phase 9) and manual webhook retry endpoint.
 | `INVALID_API_KEY` | 401 | Key not found |
 | `JOB_NOT_FOUND` | 404 | Job does not exist or belongs to a different partner |
 
-**Response fields (when completed)**
+**Response fields**
 
 | Field | Description |
 |---|---|
-| `downloadToken` | Signed, expiring token for the download endpoint |
+| `downloadToken` | Present when `COMPLETED` with a report — signed, expiring token for the download endpoint |
 | `downloadUrl` | Full URL: `{APP_BASE_URL}/v1/reports/download?token=...` |
+| `webhookDelivery` | Present when a delivery record exists — `status`, `attempts`, `lastAttempt`, `responseCode` |
+
+---
+
+### POST /v1/jobs/:id/webhooks/retry
+
+Manually re-triggers webhook delivery for a terminal job. Useful when the partner's callback endpoint was temporarily unavailable or the partner needs a fresh delivery with a new `deliveredAt` timestamp and download URL.
+
+**Headers**
+
+| Header | Required |
+|---|---|
+| `x-api-key` | Yes |
+
+**Success (202)**
+
+```json
+{
+  "jobId": "uuid",
+  "webhookDelivery": { "status": "PENDING", "attempts": 3 }
+}
+```
+
+**Error codes**
+
+| Code | HTTP | Cause |
+|---|---|---|
+| `JOB_NOT_FOUND` | 404 | Job does not exist or belongs to a different partner |
+| `JOB_NOT_TERMINAL` | 409 | Job is still `PENDING` or `PROCESSING` |
+| `WEBHOOK_DELIVERY_IN_PROGRESS` | 409 | A delivery attempt is already queued or running |
+| `QUEUE_ERROR` | 500 | Failed to enqueue the retry |
+
+Delivery is at-least-once. Partners should treat duplicate webhooks for the same `jobId` as idempotent (dedupe on `jobId` + `status`).
 
 ---
 
@@ -218,6 +251,20 @@ Any files the losing request already wrote to storage are deleted before returni
 
 ---
 
+## Webhook Retry Design
+
+**Automatic delivery:** when a job reaches `COMPLETED` or `FAILED`, `ProcessingService` calls `WebhookService.scheduleDelivery()`. This upserts a `WebhookDelivery` row and enqueues a `deliver-webhook` job on the BullMQ `delivery` queue with a deterministic ID (`webhook-{jobId}`). The worker POSTs signed JSON to the job's stored `callbackUrl`. BullMQ retries failed attempts up to 5 times with exponential backoff (2s base). Each attempt increments `attempts` and records `responseCode` when the partner returns a non-2xx status. After all retries are exhausted, the delivery row is marked `FAILED`.
+
+**Manual retry:** `POST /v1/jobs/:id/webhooks/retry` is a partner-initiated re-trigger for terminal jobs. Unlike automatic scheduling, manual retry is allowed even when the previous delivery succeeded (`DELIVERED`). The service removes any stale BullMQ job, sets the `WebhookDelivery` row back to `PENDING` (preserving the `attempts` counter), and enqueues a fresh delivery attempt. Retry always uses the `callbackUrl` stored on the job record at submission time — it does not read updated metadata.
+
+**In-flight guard:** if a BullMQ delivery job is already queued or running, manual retry returns `409 WEBHOOK_DELIVERY_IN_PROGRESS` regardless of the stored delivery status.
+
+**At-least-once semantics:** partners may receive duplicate webhooks for the same `jobId` after automatic retries or manual re-trigger. Partners should dedupe on `jobId` (and optionally `status` + `deliveredAt`) in their integration.
+
+**Enqueue failure:** if Redis is unavailable when scheduling or retrying, the `WebhookDelivery` row is marked `FAILED` and the API returns `500 QUEUE_ERROR` for manual retry.
+
+---
+
 ## File Validation
 
 File type is validated in two layers:
@@ -231,3 +278,40 @@ File type is validated in two layers:
 ## Secure Download
 
 Completed reports are served via a time-limited signed URL. The token is HMAC-SHA256 signed using `STORAGE_SECRET` and encodes the job ID with a one-hour expiry timestamp. `GET /v1/reports/download` verifies the signature using a timing-safe comparison, checks expiry, confirms the job is `COMPLETED` with a `reportPath`, and streams the PDF from local storage. Partners receive both `downloadToken` and `downloadUrl` when polling a completed job. No permanent public URL is issued.
+
+---
+
+## Testing Delivery and Retry
+
+I test delivery and retry end-to-end against a real HTTP callback using [webhook.site](https://webhook.site) as a stand-in partner endpoint. The Developer Console (`../frontend/`) drives the flow using the same API contract above.
+
+**Prepare:** complete [Setup](#setup), start the API, open webhook.site, and copy your unique inbox URL into the job form's **Callback URL** field. Use the same `x-api-key` throughout (e.g. `test-key-123`).
+
+**Test 1 — Automatic signed delivery**
+
+1. Submit a job with your webhook.site URL as `callbackUrl`.
+2. Poll `GET /v1/jobs/:id` until `status` is `COMPLETED` or `FAILED`.
+3. On webhook.site, confirm one incoming POST with `X-Webhook-Timestamp` and `X-Webhook-Signature` headers and a JSON body containing `jobId`, `status`, and `deliveredAt`.
+4. Confirm the poll response includes `"webhookDelivery": { "status": "DELIVERED", "responseCode": 200 }`.
+
+**Test 2 — Manual retry on the same job**
+
+Manual retry re-POSTs to the `callbackUrl` stored on the job. It does not require a new submission, API key, or webhook.site URL.
+
+1. On the same completed job, call `POST /v1/jobs/:id/webhooks/retry` (console **Retry** button, or `curl` against the API).
+2. Expect `202` with `"webhookDelivery": { "status": "PENDING" }`.
+3. On webhook.site, confirm a second POST for the same `jobId` with a new `deliveredAt`.
+4. Poll `GET /v1/jobs/:id` — `webhookDelivery.status` should return to `DELIVERED`.
+
+To exercise automatic retry exhaustion, configure webhook.site to return `503`, submit a job, wait for `webhookDelivery.status: "FAILED"`, then reset the inbox to `200` and run Test 2 on that job.
+
+---
+
+## What I'd Do With More Time
+
+- **Partner self-registration** — API to create partners and rotate API keys instead of Prisma Studio seeding.
+- **`GET /v1/jobs`** — paginated server-side job list so the console isn't limited to browser `localStorage` history.
+- **Encryption at rest** — envelope-encrypt attachments and reports on disk; decrypt only at serve time.
+- **Richer PDF reports** — embed metadata and a thumbnail of the first attachment page.
+- **Webhook dead-letter queue** — persist exhausted failures for ops review and bulk retry.
+- **Observability** — structured logging, queue depth metrics, and delivery latency dashboards.

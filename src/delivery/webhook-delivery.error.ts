@@ -7,3 +7,18 @@ export class WebhookDeliveryHttpError extends Error {
     this.statusCode = statusCode;
   }
 }
+
+export class WebhookDeliveryInProgressError extends Error {
+  constructor(jobId: string) {
+    super(`Webhook delivery for job ${jobId} is already in progress`);
+    this.name = 'WebhookDeliveryInProgressError';
+  }
+}
+
+export class WebhookEnqueueError extends Error {
+  constructor(jobId: string, cause?: unknown) {
+    super(`Failed to enqueue webhook delivery for job ${jobId}`);
+    this.name = 'WebhookEnqueueError';
+    this.cause = cause;
+  }
+}

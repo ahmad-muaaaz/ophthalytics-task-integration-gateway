@@ -1,11 +1,15 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { InjectQueue } from '@nestjs/bullmq';
-import { JobStatus } from '@prisma/client';
+import { DeliveryStatus, JobStatus } from '@prisma/client';
 import { Queue } from 'bullmq';
 import { createHmac } from 'node:crypto';
 import { PrismaService } from '../prisma/prisma.service';
 import { StorageService } from '../storage/storage.service';
-import { WebhookDeliveryHttpError } from './webhook-delivery.error';
+import {
+  WebhookDeliveryHttpError,
+  WebhookDeliveryInProgressError,
+  WebhookEnqueueError,
+} from './webhook-delivery.error';
 
 export type WebhookPayload = {
   jobId: string;
@@ -18,6 +22,7 @@ export type WebhookPayload = {
 const DELIVERY_ATTEMPTS = 5;
 const BACKOFF_MS = 2_000;
 const REQUEST_TIMEOUT_MS = 10_000;
+const TERMINAL_QUEUE_STATES = new Set(['completed', 'failed']);
 
 @Injectable()
 export class WebhookService {
@@ -47,30 +52,21 @@ export class WebhookService {
       return;
     }
 
-    await this.prisma.webhookDelivery.upsert({
+    await this.resetDeliveryAndEnqueue(jobId, { rethrow: false });
+  }
+
+  async retryDelivery(jobId: string): Promise<{ status: DeliveryStatus; attempts: number }> {
+    const delivery = await this.prisma.webhookDelivery.findUnique({
       where: { jobId },
-      create: { jobId, status: 'PENDING', attempts: 0 },
-      update: { status: 'PENDING' },
+      select: { attempts: true },
     });
 
-    try {
-      await this.deliveryQueue.add(
-        'deliver-webhook',
-        { jobId },
-        {
-          jobId: `webhook-${jobId}`,
-          attempts: DELIVERY_ATTEMPTS,
-          backoff: { type: 'exponential', delay: BACKOFF_MS },
-        },
-      );
-      this.logger.log(`Webhook delivery scheduled for job ${jobId}`);
-    } catch (err) {
-      this.logger.error(`Failed to enqueue webhook for job ${jobId}`, err);
-      await this.prisma.webhookDelivery.update({
-        where: { jobId },
-        data: { status: 'FAILED', lastAttempt: new Date() },
-      });
-    }
+    await this.assertDeliveryNotInProgress(jobId);
+    await this.deliveryQueue.remove(this.queueJobId(jobId));
+
+    await this.resetDeliveryAndEnqueue(jobId, { rethrow: true });
+
+    return { status: 'PENDING', attempts: delivery?.attempts ?? 0 };
   }
 
   async deliver(jobId: string): Promise<void> {
@@ -142,6 +138,47 @@ export class WebhookService {
     return createHmac('sha256', this.secret).update(`${timestamp}.${body}`).digest('hex');
   }
 
+  private async assertDeliveryNotInProgress(jobId: string): Promise<void> {
+    const queueJob = await this.deliveryQueue.getJob(this.queueJobId(jobId));
+    if (!queueJob) return;
+
+    const state = await queueJob.getState();
+    if (!TERMINAL_QUEUE_STATES.has(state)) {
+      throw new WebhookDeliveryInProgressError(jobId);
+    }
+  }
+
+  private async resetDeliveryRow(jobId: string): Promise<void> {
+    await this.prisma.webhookDelivery.upsert({
+      where: { jobId },
+      create: { jobId, status: 'PENDING', attempts: 0 },
+      update: {
+        status: 'PENDING',
+        responseCode: null,
+        nextRetryAt: null,
+      },
+    });
+  }
+
+  private async resetDeliveryAndEnqueue(
+    jobId: string,
+    options: { rethrow: boolean },
+  ): Promise<void> {
+    await this.resetDeliveryRow(jobId);
+
+    try {
+      await this.enqueueDelivery(jobId);
+      this.logger.log(`Webhook delivery scheduled for job ${jobId}`);
+    } catch (err) {
+      this.logger.error(`Failed to enqueue webhook for job ${jobId}`, err);
+      await this.prisma.webhookDelivery.update({
+        where: { jobId },
+        data: { status: 'FAILED', lastAttempt: new Date() },
+      });
+      if (options.rethrow) throw err;
+    }
+  }
+
   private async postWebhook(
     callbackUrl: string,
     body: string,
@@ -164,6 +201,26 @@ export class WebhookService {
     }
 
     return response.status;
+  }
+
+  private queueJobId(jobId: string): string {
+    return `webhook-${jobId}`;
+  }
+
+  private async enqueueDelivery(jobId: string): Promise<void> {
+    try {
+      await this.deliveryQueue.add(
+        'deliver-webhook',
+        { jobId },
+        {
+          jobId: this.queueJobId(jobId),
+          attempts: DELIVERY_ATTEMPTS,
+          backoff: { type: 'exponential', delay: BACKOFF_MS },
+        },
+      );
+    } catch (err) {
+      throw new WebhookEnqueueError(jobId, err);
+    }
   }
 
   private async recordAttempt(jobId: string, responseCode?: number): Promise<void> {

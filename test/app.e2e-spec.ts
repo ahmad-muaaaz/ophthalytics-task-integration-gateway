@@ -38,4 +38,13 @@ describe('Jobs API (e2e)', () => {
         expect(res.body.error).toBe('MISSING_TOKEN');
       });
   });
+
+  it('POST /v1/jobs/:id/webhooks/retry rejects requests without an API key', () => {
+    return request(app.getHttpServer())
+      .post('/v1/jobs/00000000-0000-0000-0000-000000000000/webhooks/retry')
+      .expect(401)
+      .expect((res) => {
+        expect(res.body.error).toBe('MISSING_API_KEY');
+      });
+  });
 });

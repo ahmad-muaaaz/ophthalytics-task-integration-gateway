@@ -116,4 +116,11 @@ export class JobsController {
   findOne(@AuthPartner() partner: { id: string }, @Param('id') id: string) {
     return this.jobsService.getJob(id, partner);
   }
+
+  @Post(':id/webhooks/retry')
+  @HttpCode(202)
+  @UseGuards(ApiKeyGuard)
+  retryWebhook(@AuthPartner() partner: { id: string }, @Param('id') id: string) {
+    return this.jobsService.retryWebhook(id, partner);
+  }
 }

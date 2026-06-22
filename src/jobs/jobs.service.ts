@@ -1,7 +1,18 @@
-import { Injectable, InternalServerErrorException, Logger, NotFoundException } from '@nestjs/common';
+import {
+  ConflictException,
+  Injectable,
+  InternalServerErrorException,
+  Logger,
+  NotFoundException,
+} from '@nestjs/common';
 import { InjectQueue } from '@nestjs/bullmq';
 import { Queue } from 'bullmq';
-import { Prisma } from '@prisma/client';
+import { Prisma, WebhookDelivery } from '@prisma/client';
+import {
+  WebhookDeliveryInProgressError,
+  WebhookEnqueueError,
+} from '../delivery/webhook-delivery.error';
+import { WebhookService } from '../delivery/webhook.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { StorageService } from '../storage/storage.service';
 import { CreateJobDto } from './dto/create-job.dto';
@@ -13,6 +24,7 @@ export class JobsService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly storage: StorageService,
+    private readonly webhookService: WebhookService,
     @InjectQueue('processing') private readonly processingQueue: Queue,
   ) {}
 
@@ -95,13 +107,14 @@ export class JobsService {
   async getJob(jobId: string, partner: { id: string }) {
     const job = await this.prisma.job.findUnique({
       where: { id: jobId },
-      include: { attachments: true },
+      include: { attachments: true, deliveries: true },
     });
 
     if (!job || job.partnerId !== partner.id) {
       throw new NotFoundException({ error: 'JOB_NOT_FOUND', message: 'Job not found' });
     }
 
+    const delivery = job.deliveries[0] ?? null;
     const downloadLinks = this.storage.buildDownloadLinksForCompletedJob(
       job.id,
       job.status,
@@ -122,7 +135,62 @@ export class JobsService {
         mimeType: a.mimeType,
         sizeBytes: a.sizeBytes,
       })),
+      ...this.formatWebhookDelivery(delivery),
       ...(downloadLinks ?? {}),
     };
+  }
+
+  async retryWebhook(jobId: string, partner: { id: string }) {
+    const job = await this.prisma.job.findUnique({
+      where: { id: jobId },
+      select: { id: true, status: true, partnerId: true },
+    });
+
+    if (!job || job.partnerId !== partner.id) {
+      throw new NotFoundException({ error: 'JOB_NOT_FOUND', message: 'Job not found' });
+    }
+
+    if (job.status !== 'COMPLETED' && job.status !== 'FAILED') {
+      throw new ConflictException({
+        error: 'JOB_NOT_TERMINAL',
+        message: 'Webhook retry is only available for completed or failed jobs',
+      });
+    }
+
+    try {
+      const webhookDelivery = await this.webhookService.retryDelivery(jobId);
+      return { jobId, webhookDelivery };
+    } catch (err) {
+      throw this.mapWebhookRetryError(err);
+    }
+  }
+
+  private formatWebhookDelivery(delivery: WebhookDelivery | null) {
+    if (!delivery) return {};
+
+    return {
+      webhookDelivery: {
+        status: delivery.status,
+        attempts: delivery.attempts,
+        ...(delivery.lastAttempt ? { lastAttempt: delivery.lastAttempt } : {}),
+        ...(delivery.responseCode !== null ? { responseCode: delivery.responseCode } : {}),
+      },
+    };
+  }
+
+  private mapWebhookRetryError(err: unknown): never {
+    if (err instanceof WebhookDeliveryInProgressError) {
+      throw new ConflictException({
+        error: 'WEBHOOK_DELIVERY_IN_PROGRESS',
+        message: 'A webhook delivery is already in progress for this job',
+      });
+    }
+    if (err instanceof WebhookEnqueueError) {
+      throw new InternalServerErrorException({
+        error: 'QUEUE_ERROR',
+        message: 'Failed to schedule webhook retry. Please try again.',
+      });
+    }
+    throw err;
   }
 }

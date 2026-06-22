@@ -2,7 +2,11 @@ import { Test, TestingModule } from '@nestjs/testing';
 import { getQueueToken } from '@nestjs/bullmq';
 import { PrismaService } from '../prisma/prisma.service';
 import { StorageService } from '../storage/storage.service';
-import { WebhookDeliveryHttpError } from './webhook-delivery.error';
+import {
+  WebhookDeliveryHttpError,
+  WebhookDeliveryInProgressError,
+  WebhookEnqueueError,
+} from './webhook-delivery.error';
 import { WebhookService } from './webhook.service';
 
 describe('WebhookService', () => {
@@ -20,7 +24,7 @@ describe('WebhookService', () => {
   let storage: {
     buildDownloadLinksForCompletedJob: jest.Mock;
   };
-  let deliveryQueue: { add: jest.Mock };
+  let deliveryQueue: { add: jest.Mock; remove: jest.Mock; getJob: jest.Mock };
   let fetchMock: jest.Mock;
 
   beforeEach(async () => {
@@ -42,7 +46,11 @@ describe('WebhookService', () => {
         downloadUrl: 'http://localhost:3000/v1/reports/download?token=signed-token',
       }),
     };
-    deliveryQueue = { add: jest.fn().mockResolvedValue({}) };
+    deliveryQueue = {
+      add: jest.fn().mockResolvedValue({}),
+      remove: jest.fn().mockResolvedValue(undefined),
+      getJob: jest.fn().mockResolvedValue(null),
+    };
     fetchMock = jest.fn();
     global.fetch = fetchMock;
 
@@ -75,7 +83,11 @@ describe('WebhookService', () => {
     expect(prisma.webhookDelivery.upsert).toHaveBeenCalledWith({
       where: { jobId: 'job-1' },
       create: { jobId: 'job-1', status: 'PENDING', attempts: 0 },
-      update: { status: 'PENDING' },
+      update: {
+        status: 'PENDING',
+        responseCode: null,
+        nextRetryAt: null,
+      },
     });
     expect(deliveryQueue.add).toHaveBeenCalledWith(
       'deliver-webhook',
@@ -197,5 +209,89 @@ describe('WebhookService', () => {
       where: { jobId: 'job-4' },
       data: expect.objectContaining({ status: 'FAILED', lastAttempt: expect.any(Date) }),
     });
+  });
+
+  it('retryDelivery resets FAILED delivery, removes queue job, and re-enqueues', async () => {
+    prisma.webhookDelivery.findUnique.mockResolvedValue({ status: 'FAILED', attempts: 3 });
+
+    const result = await service.retryDelivery('job-5');
+
+    expect(deliveryQueue.remove).toHaveBeenCalledWith('webhook-job-5');
+    expect(prisma.webhookDelivery.upsert).toHaveBeenCalledWith({
+      where: { jobId: 'job-5' },
+      create: { jobId: 'job-5', status: 'PENDING', attempts: 0 },
+      update: {
+        status: 'PENDING',
+        responseCode: null,
+        nextRetryAt: null,
+      },
+    });
+    expect(deliveryQueue.add).toHaveBeenCalledWith(
+      'deliver-webhook',
+      { jobId: 'job-5' },
+      {
+        jobId: 'webhook-job-5',
+        attempts: 5,
+        backoff: { type: 'exponential', delay: 2000 },
+      },
+    );
+    expect(result).toEqual({ status: 'PENDING', attempts: 3 });
+  });
+
+  it('retryDelivery re-enqueues even when previously DELIVERED', async () => {
+    prisma.webhookDelivery.findUnique.mockResolvedValue({ status: 'DELIVERED' });
+
+    await service.retryDelivery('job-6');
+
+    expect(deliveryQueue.remove).toHaveBeenCalledWith('webhook-job-6');
+    expect(deliveryQueue.add).toHaveBeenCalled();
+  });
+
+  it('retryDelivery throws when delivery is in progress', async () => {
+    prisma.webhookDelivery.findUnique.mockResolvedValue({ status: 'PENDING' });
+    deliveryQueue.getJob.mockResolvedValue({
+      getState: jest.fn().mockResolvedValue('active'),
+    });
+
+    await expect(service.retryDelivery('job-7')).rejects.toBeInstanceOf(
+      WebhookDeliveryInProgressError,
+    );
+    expect(deliveryQueue.add).not.toHaveBeenCalled();
+  });
+
+  it('retryDelivery marks FAILED and rethrows WebhookEnqueueError when enqueue fails', async () => {
+    prisma.webhookDelivery.findUnique.mockResolvedValue({ status: 'FAILED', attempts: 2 });
+    deliveryQueue.add.mockRejectedValue(new Error('Redis unavailable'));
+
+    await expect(service.retryDelivery('job-8')).rejects.toBeInstanceOf(WebhookEnqueueError);
+
+    expect(prisma.webhookDelivery.update).toHaveBeenCalledWith({
+      where: { jobId: 'job-8' },
+      data: expect.objectContaining({ status: 'FAILED', lastAttempt: expect.any(Date) }),
+    });
+  });
+
+  it('retryDelivery throws when queue job is in progress regardless of delivery status', async () => {
+    prisma.webhookDelivery.findUnique.mockResolvedValue({ attempts: 5 });
+    deliveryQueue.getJob.mockResolvedValue({
+      getState: jest.fn().mockResolvedValue('waiting'),
+    });
+
+    await expect(service.retryDelivery('job-9')).rejects.toBeInstanceOf(
+      WebhookDeliveryInProgressError,
+    );
+    expect(deliveryQueue.add).not.toHaveBeenCalled();
+  });
+
+  it('retryDelivery throws when queue job is paused', async () => {
+    prisma.webhookDelivery.findUnique.mockResolvedValue({ attempts: 1 });
+    deliveryQueue.getJob.mockResolvedValue({
+      getState: jest.fn().mockResolvedValue('paused'),
+    });
+
+    await expect(service.retryDelivery('job-10')).rejects.toBeInstanceOf(
+      WebhookDeliveryInProgressError,
+    );
+    expect(deliveryQueue.add).not.toHaveBeenCalled();
   });
 });
