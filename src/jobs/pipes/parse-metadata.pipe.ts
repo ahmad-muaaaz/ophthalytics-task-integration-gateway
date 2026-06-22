@@ -1,7 +1,7 @@
 import { BadRequestException, Injectable, PipeTransform } from '@nestjs/common';
 import { plainToInstance } from 'class-transformer';
 import { validate } from 'class-validator';
-import { CreateJobDto } from './create-job.dto';
+import { CreateJobDto } from '../dto/create-job.dto';
 
 @Injectable()
 export class ParseMetadataPipe implements PipeTransform {

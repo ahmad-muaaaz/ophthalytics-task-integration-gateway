@@ -1,4 +1,4 @@
-import { Injectable, InternalServerErrorException, NotFoundException } from '@nestjs/common';
+import { Injectable, InternalServerErrorException, Logger, NotFoundException } from '@nestjs/common';
 import { InjectQueue } from '@nestjs/bullmq';
 import { Queue } from 'bullmq';
 import { Prisma } from '@prisma/client';
@@ -8,6 +8,8 @@ import { CreateJobDto } from './dto/create-job.dto';
 
 @Injectable()
 export class JobsService {
+  private readonly logger = new Logger(JobsService.name);
+
   constructor(
     private readonly prisma: PrismaService,
     private readonly storage: StorageService,
@@ -20,7 +22,6 @@ export class JobsService {
     metadata: CreateJobDto & Record<string, unknown>,
     files: Express.Multer.File[],
   ) {
-    // Pre-check: return existing job if this key was already used
     const existing = await this.prisma.job.findUnique({
       where: {
         partnerId_idempotencyKey: { partnerId: partner.id, idempotencyKey },
@@ -28,10 +29,10 @@ export class JobsService {
       select: { id: true, status: true },
     });
     if (existing) {
+      this.logger.debug(`Idempotent hit for job ${existing.id}`);
       return { jobId: existing.id, status: existing.status };
     }
 
-    // Save each file to local storage
     const savedFiles = await Promise.all(
       files.map(async (file) => ({
         filename: file.originalname,
@@ -41,7 +42,6 @@ export class JobsService {
       })),
     );
 
-    // Create job + attachments atomically
     let job: { id: string; status: string };
     try {
       job = await this.prisma.$transaction(async (tx) => {
@@ -57,13 +57,9 @@ export class JobsService {
         });
       });
     } catch (e) {
-      // Files were written to disk but no DB row will reference them — clean up.
-      // allSettled so a failing unlink doesn't mask the original error.
       await Promise.allSettled(savedFiles.map((f) => this.storage.delete(f.storagePath)));
 
       if (e instanceof Prisma.PrismaClientKnownRequestError && e.code === 'P2002') {
-        // Race condition: two simultaneous requests with the same idempotency key.
-        // The DB unique constraint fires on the loser; return the winner's record.
         const raced = await this.prisma.job.findUniqueOrThrow({
           where: {
             partnerId_idempotencyKey: { partnerId: partner.id, idempotencyKey },
@@ -75,11 +71,13 @@ export class JobsService {
       throw e;
     }
 
-    // Enqueue for processing. If the queue is unreachable, mark the job FAILED
-    // immediately rather than leaving it silently stuck in PENDING with no worker
-    // ever picking it up.
     try {
-      await this.processingQueue.add('process-job', { dbJobId: job.id });
+      await this.processingQueue.add(
+        'process-job',
+        { dbJobId: job.id },
+        { attempts: 3, backoff: { type: 'exponential', delay: 1000 } },
+      );
+      this.logger.log(`Job ${job.id} enqueued for processing`);
     } catch {
       await this.prisma.job.update({
         where: { id: job.id },
@@ -100,13 +98,15 @@ export class JobsService {
       include: { attachments: true },
     });
 
-    // 404 for both "not found" and "belongs to another partner" — avoids leaking job existence
     if (!job || job.partnerId !== partner.id) {
       throw new NotFoundException({ error: 'JOB_NOT_FOUND', message: 'Job not found' });
     }
 
-    const downloadUrl =
-      job.status === 'COMPLETED' ? this.storage.signDownloadToken(job.id) : undefined;
+    const downloadLinks = this.storage.buildDownloadLinksForCompletedJob(
+      job.id,
+      job.status,
+      job.reportPath,
+    );
 
     return {
       jobId: job.id,
@@ -122,7 +122,7 @@ export class JobsService {
         mimeType: a.mimeType,
         sizeBytes: a.sizeBytes,
       })),
-      ...(downloadUrl ? { downloadUrl } : {}),
+      ...(downloadLinks ?? {}),
     };
   }
 }

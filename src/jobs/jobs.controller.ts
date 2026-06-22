@@ -16,7 +16,7 @@ import { memoryStorage } from 'multer';
 import { ApiKeyGuard } from '../auth/api-key.guard';
 import { AuthPartner } from '../auth/auth-partner.decorator';
 import { CreateJobDto } from './dto/create-job.dto';
-import { ParseMetadataPipe } from './dto/parse-metadata.pipe';
+import { ParseMetadataPipe } from './pipes/parse-metadata.pipe';
 import { JobsService } from './jobs.service';
 
 const ALLOWED_MIMES = new Set(['image/jpeg', 'image/png', 'image/tiff', 'application/pdf']);

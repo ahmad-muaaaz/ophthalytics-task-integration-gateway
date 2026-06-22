@@ -60,7 +60,7 @@ model Attachment {
 model WebhookDelivery {
   id           String         @id @default(uuid())
   job          Job            @relation(fields: [jobId], references: [id])
-  jobId        String
+  jobId        String         @unique
   status       DeliveryStatus @default(PENDING)
   attempts     Int            @default(0)
   lastAttempt  DateTime?

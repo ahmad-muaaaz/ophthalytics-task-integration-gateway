@@ -4,7 +4,7 @@ import { AuthModule } from '../auth/auth.module';
 import { StorageModule } from '../storage/storage.module';
 import { JobsController } from './jobs.controller';
 import { JobsService } from './jobs.service';
-import { ParseMetadataPipe } from './dto/parse-metadata.pipe';
+import { ParseMetadataPipe } from './pipes/parse-metadata.pipe';
 
 @Module({
   imports: [
